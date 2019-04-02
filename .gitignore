@@ -1,0 +1,6 @@
+# Editor directoies
+.vscode/
+.idea/
+
+# SQLite test files
+*.sqlite
