@@ -84,21 +84,22 @@ func Exists(name string) bool {
 	return true
 }
 
-// toBlobString takes a value interface and checks its type, returning an
-// unsigned integer representing this type and a string containing binary
-// data representing it. If the type is not allowed, an error is returned.
-func toBlobString(value interface{}) (string, uint, error) {
+// toValueType takes a value interface and checks its type, returning an
+// unsigned integer representing this type. If the type is not allowed, an
+// error is returned.
+func toValueType(value interface{}) (uint, error) {
 	switch value.(type) {
 	case bool:
-		return strconv.FormatBool(value.(bool)), 0, nil
+		return 0, nil
 	case int:
-		return strconv.FormatInt(int64(value.(int)), 10), 1, nil
+		return 1, nil
 	case float64:
-		return strconv.FormatFloat(value.(float64), 'E', -1, 64), 2, nil
+		return 2, nil
 	case string:
-		return value.(string), 3, nil
+		return 3, nil
 	default:
-		return "", 0, errors.New("metadb: attempt to set a value with a disallowed type")
+		return 0, errors.New("metadb: value is of a disallowed type " +
+			"(allowed: bool, int, float64, string)")
 	}
 }
 
@@ -189,7 +190,7 @@ func MustGet(name string) interface{} {
 // set implements the code shared between Set and ForceSet, using an additional
 // parameter to differentiate between the two.
 func set(name string, value interface{}, force bool) error {
-	_, valueType, err := toBlobString(value)
+	valueType, err := toValueType(value)
 	if err != nil {
 		return err
 	}

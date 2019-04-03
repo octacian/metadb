@@ -88,6 +88,28 @@ func insertFixtures(db *sql.DB, fixtures []entryFixture) {
 	}
 }
 
+// getFixtures returns an array of entryFixtures read from all the metadata
+// entries in the provided database, most commonly used after insertFixtures.
+func getFixtures(db *sql.DB) map[string]*entryFixture {
+	rows, err := db.Query("SELECT Name, Value, ValueType FROM metadata;")
+	if err != nil {
+		panic(fmt.Sprint("tests: failed to retrieve fixtures:\n", err))
+	}
+
+	fixtures := make(map[string]*entryFixture)
+	for rows.Next() {
+		var value string
+		fixture := entryFixture{}
+		if err := rows.Scan(&fixture.Name, &value, &fixture.ValueType); err != nil {
+			panic(fmt.Sprint("tests: failed to scan row while retrieving fixtures:\n", err))
+		}
+		fixture.Value = value
+		fixtures[fixture.Name] = &fixture
+	}
+
+	return fixtures
+}
+
 // TestPrepare ensures that Prepare does not panic.
 func TestPrepare(t *testing.T) {
 	db := openDB()
@@ -129,85 +151,73 @@ func TestExists(t *testing.T) {
 	}
 }
 
-// TestBlobStringConversion ensures that data is accurately converted to and
-// from blob strings.
-func TestBlobStringConversion(t *testing.T) {
-	bool1, vtbool1, _ := toBlobString(true)
-	if res, err := fromBlobString(bool1, vtbool1); err != nil {
-		t.Errorf("fromBlobString: got error:\n%s", err)
-	} else {
-		if res != true {
-			t.Errorf("fromBlobString: got '%b' expected 'true'", res)
+// TestToValueType ensures that the correct type index is returned for each of
+// the allowed types.
+func TestToValueType(t *testing.T) {
+	testValid := func(value interface{}, expected uint) {
+		if res, err := toValueType(value); err != nil {
+			t.Error("toValueType: got error:\n", err)
+		} else if res != expected {
+			t.Errorf("toValueType: got '%d' expected '%d'", res, expected)
 		}
 	}
 
-	bool2, vtbool2, _ := toBlobString(false)
-	if res, err := fromBlobString(bool2, vtbool2); err != nil {
-		t.Errorf("fromBlobString: got error:\n%s", err)
-	} else {
-		if res != false {
-			t.Errorf("fromBlobString: got '%b' expected 'false'", res)
+	testValid(true, 0)
+	testValid(281, 1)
+	testValid(43.183, 2)
+	testValid("hello world!", 3)
+
+	if _, err := toValueType([]string{"disallowed", "type"}); err == nil {
+		t.Error("toValueType: expected error with disallowed type")
+	}
+}
+
+// TestFromBlobString ensures that the correct data is returned for a number
+// of combinations of blob strings and value types.
+func TestFromBlobString(t *testing.T) {
+	db := openDB()
+	defer closeDB()
+	Prepare(db)
+
+	insertFixtures(db, []entryFixture{
+		{Name: "bool", Value: true, ValueType: 0},
+		{Name: "invalidBool", Value: "maybe", ValueType: 0},
+		{Name: "int", Value: 239, ValueType: 1},
+		{Name: "invalidInt", Value: "not a number", ValueType: 1},
+		{Name: "float", Value: 21.42, ValueType: 2},
+		{Name: "invalidFloat", Value: "21.48aje21", ValueType: 2},
+		{Name: "string", Value: "hello world!", ValueType: 3},
+		{Name: "unknown", Value: "nothing", ValueType: 100},
+	})
+
+	fixtures := getFixtures(db)
+
+	testFixture := func(name string, expected interface{}) {
+		fixture := fixtures[name]
+		res, err := fromBlobString(fixture.Value.(string), fixture.ValueType)
+		if err != nil {
+			t.Error("fromBlobString: got errror:\n", err)
+		} else if res != expected {
+			t.Errorf("fromBlobString: got '%v' expected '%v'", res, expected)
 		}
 	}
 
-	int1, vtint1, _ := toBlobString(583)
-	if res, err := fromBlobString(int1, vtint1); err != nil {
-		t.Errorf("fromBlobString: got error:\n%s", err)
-	} else {
-		if res != 583 {
-			t.Errorf("fromBlobString: got '%d' expected '583'", res)
+	expectError := func(name string, msg string) {
+		fixture := fixtures[name]
+		if _, err := fromBlobString(fixture.Value.(string), fixture.ValueType); err == nil {
+			t.Errorf("fromBlobString: expected error with %s", msg)
 		}
 	}
 
-	float, vtfloat, _ := toBlobString(43.6812)
-	if res, err := fromBlobString(float, vtfloat); err != nil {
-		t.Errorf("fromBlobString: got error:\n%s", err)
-	} else {
-		if res != 43.6812 {
-			t.Errorf("fromBlobString: got '%d' expected '43.6812'", res)
-		}
-	}
+	testFixture("bool", true)
+	testFixture("int", 239)
+	testFixture("float", 21.42)
+	testFixture("string", "hello world!")
 
-	string1, vtstring1, _ := toBlobString("hello world!")
-	if res, err := fromBlobString(string1, vtstring1); err != nil {
-		t.Errorf("fromBlobString: got error:\n%s", err)
-	} else {
-		if res != "hello world!" {
-			t.Errorf("fromBlobString: got '%d' expected 'hello world!'", res)
-		}
-	}
-
-	if _, _, err := toBlobString([]string{"disallowed", "type"}); err == nil {
-		t.Errorf("fromBlobString: expected error with disallowed type")
-	}
-
-	if _, err := fromBlobString("invalid", 0); err == nil {
-		t.Errorf("fromBlobString: expected error with invalid value for parsing")
-	} else {
-		if _, ok := err.(*ErrFailedToParse); !ok {
-			t.Errorf("fromBlobString: expected error of type *ErrFailedToParse, got %s", err)
-		}
-	}
-
-	if _, err := fromBlobString("invalid", 1); err == nil {
-		t.Errorf("fromBlobString: expected error with invalid value for parsing")
-	} else {
-		if _, ok := err.(*ErrFailedToParse); !ok {
-			t.Errorf("fromBlobString: expected error of type *ErrFailedToParse, got %s", err)
-		}
-	}
-
-	if _, err := fromBlobString("invalid", 2); err == nil {
-		t.Errorf("fromBlobString: expected error with invalid value for parsing")
-	} else {
-		if _, ok := err.(*ErrFailedToParse); !ok {
-			t.Errorf("fromBlobString: expected error of type *ErrFailedToParse, got %s", err)
-		}
-	}
-
-	if _, err := fromBlobString("12.8", 100); err == nil {
-		t.Errorf("fromBlobString: expected error with invalid value type for parsing")
-	}
+	expectError("invalidBool", "invalid boolean blob string")
+	expectError("invalidInt", "invalid integer blob string")
+	expectError("invalidFloat", "invalid float blob string")
+	expectError("unknown", "invalid value type")
 }
 
 // TestGetValueType ensures that getValueType returns accurate data.
