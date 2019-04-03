@@ -1,3 +1,20 @@
+/*
+Package metadb provides key-value data storage APIs for interaction with a
+metadata table within an SQL database.
+
+Basics
+
+To get started with metadb, open a database connection and prepare the metadata
+table:
+
+	database, _ := sql.Open(...) // Open a database connection
+	defer database.Close()
+
+	metadb.Prepare(database) // Prepare the metadata table
+
+	metadb.Set("foo", "bar") // Set key "foo" to contain value "bar"
+	fmt.Println(metadb.Get("foo")) // Retrieve and print key "foo"
+*/
 package metadb
 
 import (
@@ -14,43 +31,42 @@ type ErrNoEntry struct {
 	Name string
 }
 
-// Error implements the error interface for ErrNoEntry
+// Error implements the error interface for ErrNoEntry.
 func (err *ErrNoEntry) Error() string {
 	return fmt.Sprintf("metadb: no entry for '%s'", err.Name)
 }
 
-// ErrFailedToParse is returned by fromBlobString when a blob string cannot be
+// ErrFailedToParse is returned indirectly by Get when a blob string cannot be
 // parsed.
 type ErrFailedToParse struct {
 	Err error
 }
 
-// Error implements the error interface for ErrFailedToParse
+// Error implements the error interface for ErrFailedToParse.
 func (err *ErrFailedToParse) Error() string {
 	return fmt.Sprintf("metadb: failed to parse value blob string:\n%s", err.Err)
 }
 
-// Prepare takes a database object and creates the metadata table if it doesn't exist
+// Prepare takes a database object and creates the metadata table if it doesn't exist.
 func Prepare(db *sql.DB) {
-	//-- 0 = bool, 1 = int, 2 = float64, 3 = string
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS metadata(
 			ID INT AUTO_INCREMENT PRIMARY KEY,
 			Name VARCHAR(255) NOT NULL UNIQUE,
 			Value BLOB NOT NULL,
 			ValueType TINYINT NOT NULL
+			-- 0 = bool, 1 = int, 2 = float64, 3 = string
 		);
 	`)
 
 	if err != nil {
-		//fmt.Println(err)
 		panic(fmt.Errorf("failed to create metadata table:\n%s", err))
 	}
 
 	database = db
 }
 
-// Exists returns a boolean indicating whether the named metadata entry exists
+// Exists returns true if the requested entry exists, and false if it does not.
 func Exists(name string) bool {
 	row := database.QueryRow("SELECT Name FROM metadata WHERE name = ?;", name)
 	var receivedName string
@@ -68,10 +84,9 @@ func Exists(name string) bool {
 	return true
 }
 
-// toBlobString takes a value interface and checks its type, returning not only
-// an unsigned integer representing this type, but also a string containing
-// binary data representing it. If the type is not allowed, an error is
-// returned.
+// toBlobString takes a value interface and checks its type, returning an
+// unsigned integer representing this type and a string containing binary
+// data representing it. If the type is not allowed, an error is returned.
 func toBlobString(value interface{}) (string, uint, error) {
 	switch value.(type) {
 	case bool:
@@ -87,11 +102,11 @@ func toBlobString(value interface{}) (string, uint, error) {
 	}
 }
 
-// fromBlobString takes a string and an unsigned integer, the former
-// being the result of retreiving a blob string from the database and the
-// latter denoting the type of data stored within the blob string. An interface
-// containing the decoded value is returned, and an error if anything goes
-// wrong.
+// fromBlobString takes a string and an unsigned integer. The string is
+// retrieved directly from the database and contains some raw data, while the
+// unsigned integer represents the type of data retrieved and therefore how it
+// is to be processed. An interface containing the decoded value is returned,
+// or an error if conversion fails or the data type is invalid.
 func fromBlobString(value string, valueType uint) (interface{}, error) {
 	switch valueType {
 	case 0: // value is a boolean
@@ -122,8 +137,8 @@ func fromBlobString(value string, valueType uint) (interface{}, error) {
 	}
 }
 
-// getValueType returns an unsigned integer representing the value stored
-// within the metadata entry requested, or an ErrNoEntry if no entry exists.
+// getValueType returns an unsigned integer representing the type of data
+// stored in the requested metadata entry, or an ErrNoEntry if none exists.
 func getValueType(name string) (uint, error) {
 	row := database.QueryRow("SELECT ValueType FROM metadata WHERE name = ?", name)
 	var valueType uint
@@ -141,8 +156,9 @@ func getValueType(name string) (uint, error) {
 	return valueType, nil
 }
 
-// Get returns an interface containing the value of the metadata entry requested,
-// if it exists, and an error if it does not exist or if the ValueType is invalid
+// Get returns an interface containing the data within the requested entry. If
+// the entry does not exist or if the stored data type identifier is invalid,
+// an error is returned.
 func Get(name string) (interface{}, error) {
 	row := database.QueryRow("SELECT Value, ValueType FROM metadata WHERE name = ?", name)
 	var value string
@@ -161,8 +177,7 @@ func Get(name string) (interface{}, error) {
 	return fromBlobString(value, valueType)
 }
 
-// MustGet returns an interface containing the value of the metadata entry requested,
-// and panics if it does not exist or the ValueType is invalid
+// MustGet does the same as Get, but panics if an error is returned.
 func MustGet(name string) interface{} {
 	if res, err := Get(name); err != nil {
 		panic(err)
@@ -171,8 +186,8 @@ func MustGet(name string) interface{} {
 	}
 }
 
-// set implements the code shared between Set and ForceSet, including an
-// additional argument to control whether updating is forced.
+// set implements the code shared between Set and ForceSet, using an additional
+// parameter to differentiate between the two.
 func set(name string, value interface{}, force bool) error {
 	_, valueType, err := toBlobString(value)
 	if err != nil {
@@ -206,32 +221,24 @@ func set(name string, value interface{}, force bool) error {
 	return nil
 }
 
-// Set inserts or updates a metadata entry and returns an error if the data
-// inputted is not of an allowed type or clashes with the type of the data
-// currently stored within the entry.
-//
-// Allowed types are:
-// * bool
-// * int
-// * float64
-// * string
+// Set inserts or updates a metadata entry. If the type of the new value is not
+// one of bool, int, float64, or string, an error is returned. Or, if the entry
+// already exists and the data type of the new value is different than that of
+// the current, an error is also returned.
 func Set(name string, value interface{}) error {
 	return set(name, value, false)
 }
 
-// MustSet inserts or updates an entry and panics if the data inputted is not
-// of an allowed type or clashes with the type of the data currently stored
-// within the entry.
+// MustSet does the same as Set, but panics if an error is returned.
 func MustSet(name string, value interface{}) {
 	if err := Set(name, value); err != nil {
 		panic(err)
 	}
 }
 
-// ForceSet inerts or updates an entry and returns an error only if the data
-// inputted is not of an allowed type. Attempting to change the value for an
-// existing entry to something of a type different than the current will not
-// raise an error, unlike Set and MustSet.
+// ForceSet does the same as Set, but does not return an error if the entry
+// already exists and the data type of the new value is different than that of
+// the current.
 func ForceSet(name string, value interface{}) error {
 	return set(name, value, true)
 }

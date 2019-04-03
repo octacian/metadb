@@ -13,8 +13,8 @@ import (
 const TestDBPath = "./test.sqlite"
 
 // panicked takes a simple function to execute and returns an error containing
-// the data returned from a call to panic within the function, or nil if no
-// call to panic occurred.
+// the data passed to panic from within the function, and nil if no panic
+// occurred.
 func panicked(fn func()) error {
 	ch := make(chan error)
 	go func() {
