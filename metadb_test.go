@@ -116,7 +116,7 @@ func TestPrepare(t *testing.T) {
 	defer closeDB()
 
 	if err := panicked(func() { Prepare(db) }); err != nil {
-		t.Error("Prepare: got panic:\n", err)
+		t.Fatal("Prepare: got panic:\n", err)
 	}
 }
 
@@ -124,7 +124,7 @@ func TestPrepare(t *testing.T) {
 // database connection.
 func TestPrepareShouldPanic(t *testing.T) {
 	if err := panicked(func() { Prepare(&sql.DB{}) }); err == nil {
-		t.Error("Prepare: expected panic with invalid database connection")
+		t.Fatal("Prepare: expected panic with invalid database connection")
 	}
 }
 
@@ -135,19 +135,15 @@ func TestExists(t *testing.T) {
 	Prepare(db)
 
 	insertFixtures(db, []entryFixture{
-		{
-			Name:      "foo",
-			Value:     "bar",
-			ValueType: 3,
-		},
+		{Name: "foo", Value: "bar", ValueType: 3},
 	})
 
 	if Exists("bar") {
-		t.Errorf("Exists: got 'true' expected 'false'")
+		t.Error("Exists: got 'true' expected 'false'")
 	}
 
 	if !Exists("foo") {
-		t.Errorf("Exists: got 'false' expected 'true'")
+		t.Error("Exists: got 'false' expected 'true'")
 	}
 }
 
@@ -227,41 +223,26 @@ func TestGetValueType(t *testing.T) {
 	Prepare(db)
 
 	insertFixtures(db, []entryFixture{
-		{
-			Name:      "foo",
-			Value:     "1",
-			ValueType: 0,
-		},
-		{
-			Name:      "bar",
-			Value:     "1011",
-			ValueType: 1,
-		},
+		{Name: "foo", Value: "1", ValueType: 0},
+		{Name: "bar", Value: "1011", ValueType: 1},
 	})
 
-	valueTypeFoo, err := getValueType("foo")
-	if err != nil {
-		t.Errorf("getValueType: got error:\n%s", err)
-	}
-	if valueTypeFoo != 0 {
-		t.Errorf("getValueType: got '%d' expected '0'", valueTypeFoo)
-	}
-
-	valueTypeBar, err := getValueType("bar")
-	if err != nil {
-		t.Errorf("getValueType: got error:\n%s", err)
-	}
-	if valueTypeBar != 1 {
-		t.Errorf("getValueType: got '%d' expected 1", valueTypeBar)
-	}
-
-	_, err = getValueType("unknown")
-	if err == nil {
-		t.Errorf("getValueType: expected error with missing entry")
-	} else {
-		if _, ok := err.(*ErrNoEntry); !ok {
-			t.Errorf("getValueType: expected error of type *ErrNoEntry")
+	testValueType := func(name string, expected uint) {
+		if res, err := getValueType(name); err != nil {
+			t.Error("getValueType: got error:\n", err)
+		} else if res != expected {
+			t.Errorf("getValueType: got '%d' expected '%d'", res, expected)
 		}
+	}
+
+	testValueType("foo", 0)
+	testValueType("bar", 1)
+
+	_, err := getValueType("unknown")
+	if err == nil {
+		t.Error("getValueType: expected error with missing entry")
+	} else if _, ok := err.(*ErrNoEntry); !ok {
+		t.Error("getValueType: expected error of type *ErrNoEntry")
 	}
 }
 
@@ -273,6 +254,16 @@ func TestGetAndSet(t *testing.T) {
 	defer closeDB()
 	Prepare(db)
 
+	checkResultWithBool := func(name string, fetched interface{}, expected bool) {
+		if res, ok := fetched.(bool); ok {
+			if res != expected {
+				t.Errorf("%s: got '%t' expected '%t'", name, res, expected)
+			}
+		} else {
+			t.Error("Get: got result of an unknown type, expected 'bool'")
+		}
+	}
+
 	if err := Set("foo", true); err != nil {
 		t.Fatal("Set: got error:\n", err)
 	}
@@ -280,13 +271,7 @@ func TestGetAndSet(t *testing.T) {
 	if foo, err := Get("foo"); err != nil {
 		t.Error("Get: got error:\n", err)
 	} else {
-		if res, ok := foo.(bool); ok {
-			if res != true {
-				t.Errorf("Get: got '%t' expected 'true'", res)
-			}
-		} else {
-			t.Error("Get: got result of an unknown type, expected 'bool'")
-		}
+		checkResultWithBool("Get", foo, true)
 	}
 
 	if _, err := Get("bar"); err == nil {
@@ -298,13 +283,7 @@ func TestGetAndSet(t *testing.T) {
 	}
 
 	foo := MustGet("foo")
-	if res, ok := foo.(bool); ok {
-		if res != false {
-			t.Errorf("MustGet got '%t' expected 'false'", res)
-		}
-	} else {
-		t.Error("MustGet: got result of an unknown type, expected 'bool'")
-	}
+	checkResultWithBool("MustGet", foo, false)
 
 	if err := panicked(func() { MustGet("bar") }); err == nil {
 		t.Error("MustGet: expected panic with non-existent entry")
@@ -321,7 +300,7 @@ func TestGetAndSet(t *testing.T) {
 	}
 
 	if err := panicked(func() { MustSet("foo", true) }); err != nil {
-		t.Error("MustSet: got error:\n", err)
+		t.Error("MustSet: got panic:\n", err)
 	}
 
 	if err := panicked(func() { MustSet("foo", 1834) }); err == nil {
