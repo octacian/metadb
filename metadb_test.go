@@ -12,6 +12,13 @@ import (
 
 const TestDBPath = "./test.sqlite"
 
+// TODO: Should unit tests be refactored so that all tests of methods attached
+// to Instance are coupled to the test for NewInstance itself? This could
+// entirely eliminate the need to work with fixtures as all data would be
+// directly manipulated by the very methods being tested. Not only that, but
+// this might eliminate the need to separately test toValueType and
+// fromBlobString.
+
 // panicked takes a simple function to execute and returns an error containing
 // the data passed to panic from within the function, and nil if no panic
 // occurred.
@@ -40,45 +47,49 @@ func panicked(fn func()) error {
 	return <-ch
 }
 
-// openDB connects to an SQLite3 database at the path specified by TestDBPath.
-func openDB() *sql.DB {
+// RunWithDB runs a closure passing it a database handle which is disposed of
+// afterward.
+func RunWithDB(fn func(*sql.DB)) {
 	db, err := sql.Open("sqlite3", TestDBPath)
 	if err != nil {
 		panic(err)
 	}
 
-	return db
-}
+	fn(db)
 
-// closeDB disconnects from the database, if one is connected, and removes the
-// residual SQLite file.
-func closeDB() {
-	if database != nil {
-		err := database.Close()
-		if err != nil {
-			panic(err)
-		}
+	err = db.Close()
+	if err != nil {
+		panic(err)
 	}
-
-	database = nil
 
 	if err := os.Remove(TestDBPath); err != nil {
 		panic(err)
 	}
 }
 
-// entryFixture contains the basic data required for a metadata entry.
-type entryFixture struct {
+// RunWithInstance runs a closure passing it an Instance.
+func RunWithInstance(fn func(*Instance)) {
+	RunWithDB(func(db *sql.DB) {
+		if instance, err := NewInstance(db); err != nil {
+			panic(err)
+		} else {
+			fn(instance)
+		}
+	})
+}
+
+// EntryFixture contains the basic data required for a metadata entry.
+type EntryFixture struct {
 	Name      string
 	Value     interface{}
 	ValueType uint
 }
 
-// insertFixtures takes a list of entryFixtures and inserts them into the
-// provided database.
-func insertFixtures(db *sql.DB, fixtures []entryFixture) {
+// InsertFixtures takes a list of EntryFixtures and inserts them into the
+// database handle managed by the provided Instance.
+func InsertFixtures(instance *Instance, fixtures []EntryFixture) {
 	for _, fixture := range fixtures {
-		_, err := db.Exec(`
+		_, err := instance.DB.Exec(`
 			INSERT INTO metadata (Name, Value, ValueType) Values (?, ?, ?)
 		`, fixture.Name, fixture.Value, fixture.ValueType)
 
@@ -88,20 +99,20 @@ func insertFixtures(db *sql.DB, fixtures []entryFixture) {
 	}
 }
 
-// getFixtures returns an array of entryFixtures read from all the metadata
-// entries in the provided database, most commonly used after insertFixtures.
-func getFixtures(db *sql.DB) map[string]*entryFixture {
-	rows, err := db.Query("SELECT Name, Value, ValueType FROM metadata;")
+// GetFixtures returns an array of EntryFixtures read from all the metadata
+// entries in the database managed by the provided Instance.
+func GetFixtures(instance *Instance) map[string]*EntryFixture {
+	rows, err := instance.DB.Query("SELECT Name, Value, ValueType FROM metadata;")
 	if err != nil {
 		panic(fmt.Sprint("tests: failed to retrieve fixtures:\n", err))
 	}
 
-	fixtures := make(map[string]*entryFixture)
+	fixtures := make(map[string]*EntryFixture)
 	for rows.Next() {
 		var value string
-		fixture := entryFixture{}
+		fixture := EntryFixture{}
 		if err := rows.Scan(&fixture.Name, &value, &fixture.ValueType); err != nil {
-			panic(fmt.Sprint("tests: failed to scan row while retrieving fixtures:\n", err))
+			panic(fmt.Errorf("tests: failed to scan row while retrieving fixtures:\n%s", err))
 		}
 		fixture.Value = value
 		fixtures[fixture.Name] = &fixture
@@ -110,41 +121,35 @@ func getFixtures(db *sql.DB) map[string]*entryFixture {
 	return fixtures
 }
 
-// TestPrepare ensures that Prepare does not panic.
-func TestPrepare(t *testing.T) {
-	db := openDB()
-	defer closeDB()
-
-	if err := panicked(func() { Prepare(db) }); err != nil {
-		t.Fatal("Prepare: got panic:\n", err)
+// TestNewInstance ensures that an Instance object is returned as expected with
+// a valid database handle, and an error with an invalid handle.
+func TestNewInstance(t *testing.T) {
+	if _, err := NewInstance(nil); err == nil {
+		t.Error("NewInstance: expected error with nil database handle")
 	}
-}
 
-// TestPrepareShouldPanic ensures that Prepare panics when provided an invalid
-// database connection.
-func TestPrepareShouldPanic(t *testing.T) {
-	if err := panicked(func() { Prepare(&sql.DB{}) }); err == nil {
-		t.Fatal("Prepare: expected panic with invalid database connection")
-	}
-}
-
-// TestExists ensures that Exists returns accurate data.
-func TestExists(t *testing.T) {
-	db := openDB()
-	defer closeDB()
-	Prepare(db)
-
-	insertFixtures(db, []entryFixture{
-		{Name: "foo", Value: "bar", ValueType: 3},
+	RunWithDB(func(db *sql.DB) {
+		if _, err := NewInstance(db); err != nil {
+			t.Fatal("NewInstance: got error:\n", err)
+		}
 	})
+}
 
-	if Exists("bar") {
-		t.Error("Exists: got 'true' expected 'false'")
-	}
+// TestExists ensures that Instance.Exists is accurate.
+func TestExists(t *testing.T) {
+	RunWithInstance(func(instance *Instance) {
+		InsertFixtures(instance, []EntryFixture{
+			{Name: "foo", Value: "bar", ValueType: 3},
+		})
 
-	if !Exists("foo") {
-		t.Error("Exists: got 'false' expected 'true'")
-	}
+		if instance.Exists("bar") {
+			t.Error("Instance.Exists: got 'true' expected 'false'")
+		}
+
+		if !instance.Exists("foo") {
+			t.Error("Instance.Exists: got 'false' expected 'true'")
+		}
+	})
 }
 
 // TestToValueType ensures that the correct type index is returned for each of
@@ -171,151 +176,175 @@ func TestToValueType(t *testing.T) {
 // TestFromBlobString ensures that the correct data is returned for a number
 // of combinations of blob strings and value types.
 func TestFromBlobString(t *testing.T) {
-	db := openDB()
-	defer closeDB()
-	Prepare(db)
+	RunWithInstance(func(instance *Instance) {
+		InsertFixtures(instance, []EntryFixture{
+			{Name: "bool", Value: true, ValueType: 0},
+			{Name: "invalidBool", Value: "maybe", ValueType: 0},
+			{Name: "int", Value: 239, ValueType: 1},
+			{Name: "invalidInt", Value: "not a number", ValueType: 1},
+			{Name: "float", Value: 21.42, ValueType: 2},
+			{Name: "invalidFloat", Value: "21.48aje21", ValueType: 2},
+			{Name: "string", Value: "hello world!", ValueType: 3},
+			{Name: "unknown", Value: "nothing", ValueType: 100},
+		})
 
-	insertFixtures(db, []entryFixture{
-		{Name: "bool", Value: true, ValueType: 0},
-		{Name: "invalidBool", Value: "maybe", ValueType: 0},
-		{Name: "int", Value: 239, ValueType: 1},
-		{Name: "invalidInt", Value: "not a number", ValueType: 1},
-		{Name: "float", Value: 21.42, ValueType: 2},
-		{Name: "invalidFloat", Value: "21.48aje21", ValueType: 2},
-		{Name: "string", Value: "hello world!", ValueType: 3},
-		{Name: "unknown", Value: "nothing", ValueType: 100},
+		fixtures := GetFixtures(instance)
+
+		testFixture := func(name string, expected interface{}) {
+			fixture := fixtures[name]
+			res, err := fromBlobString(fixture.Value.(string), fixture.ValueType)
+			if err != nil {
+				t.Error("fromBlobString: got errror:\n", err)
+			} else if res != expected {
+				t.Errorf("fromBlobString: got '%v' expected '%v'", res, expected)
+			}
+		}
+
+		expectError := func(name string, msg string) {
+			fixture := fixtures[name]
+			if _, err := fromBlobString(fixture.Value.(string), fixture.ValueType); err == nil {
+				t.Errorf("fromBlobString: expected error with %s", msg)
+			}
+		}
+
+		testFixture("bool", true)
+		testFixture("int", 239)
+		testFixture("float", 21.42)
+		testFixture("string", "hello world!")
+
+		expectError("invalidBool", "invalid boolean blob string")
+		expectError("invalidInt", "invalid integer blob string")
+		expectError("invalidFloat", "invalid float blob string")
+		expectError("unknown", "invalid value type")
 	})
-
-	fixtures := getFixtures(db)
-
-	testFixture := func(name string, expected interface{}) {
-		fixture := fixtures[name]
-		res, err := fromBlobString(fixture.Value.(string), fixture.ValueType)
-		if err != nil {
-			t.Error("fromBlobString: got errror:\n", err)
-		} else if res != expected {
-			t.Errorf("fromBlobString: got '%v' expected '%v'", res, expected)
-		}
-	}
-
-	expectError := func(name string, msg string) {
-		fixture := fixtures[name]
-		if _, err := fromBlobString(fixture.Value.(string), fixture.ValueType); err == nil {
-			t.Errorf("fromBlobString: expected error with %s", msg)
-		}
-	}
-
-	testFixture("bool", true)
-	testFixture("int", 239)
-	testFixture("float", 21.42)
-	testFixture("string", "hello world!")
-
-	expectError("invalidBool", "invalid boolean blob string")
-	expectError("invalidInt", "invalid integer blob string")
-	expectError("invalidFloat", "invalid float blob string")
-	expectError("unknown", "invalid value type")
 }
 
 // TestGetValueType ensures that getValueType returns accurate data.
 func TestGetValueType(t *testing.T) {
-	db := openDB()
-	defer closeDB()
-	Prepare(db)
+	RunWithInstance(func(instance *Instance) {
+		InsertFixtures(instance, []EntryFixture{
+			{Name: "foo", Value: "1", ValueType: 0},
+			{Name: "bar", Value: "1011", ValueType: 1},
+		})
 
-	insertFixtures(db, []entryFixture{
-		{Name: "foo", Value: "1", ValueType: 0},
-		{Name: "bar", Value: "1011", ValueType: 1},
-	})
-
-	testValueType := func(name string, expected uint) {
-		if res, err := getValueType(name); err != nil {
-			t.Error("getValueType: got error:\n", err)
-		} else if res != expected {
-			t.Errorf("getValueType: got '%d' expected '%d'", res, expected)
+		testValueType := func(name string, expected uint) {
+			if res, err := instance.getValueType(name); err != nil {
+				t.Error("Instance.getValueType: got error:\n", err)
+			} else if res != expected {
+				t.Errorf("Instance.getValueType: got '%d' expected '%d'", res, expected)
+			}
 		}
-	}
 
-	testValueType("foo", 0)
-	testValueType("bar", 1)
+		testValueType("foo", 0)
+		testValueType("bar", 1)
 
-	_, err := getValueType("unknown")
-	if err == nil {
-		t.Error("getValueType: expected error with missing entry")
-	} else if _, ok := err.(*ErrNoEntry); !ok {
-		t.Error("getValueType: expected error of type *ErrNoEntry")
-	}
+		_, err := instance.getValueType("unknown")
+		if err == nil {
+			t.Error("Instance.getValueType: expected error with missing entry")
+		} else if _, ok := err.(*ErrNoEntry); !ok {
+			t.Error("Instance.getValueType: expected error of type *ErrNoEntry")
+		}
+	})
 }
 
 // TestGetAndSet ensures that Get and Set respond as expected to different
 // combinations of data and that data can be accurately read and updated
 // once set.
 func TestGetAndSet(t *testing.T) {
-	db := openDB()
-	defer closeDB()
-	Prepare(db)
-
-	checkResultWithBool := func(name string, fetched interface{}, expected bool) {
-		if res, ok := fetched.(bool); ok {
-			if res != expected {
-				t.Errorf("%s: got '%t' expected '%t'", name, res, expected)
+	RunWithInstance(func(instance *Instance) {
+		checkResultWithBool := func(name string, fetched interface{}, expected bool) {
+			if res, ok := fetched.(bool); ok {
+				if res != expected {
+					t.Errorf("Instance.%s: got '%t' expected '%t'", name, res, expected)
+				}
+			} else {
+				t.Errorf("Instance.%s: got result of an unknown type, expected 'bool'", name)
 			}
-		} else {
-			t.Error("Get: got result of an unknown type, expected 'bool'")
 		}
-	}
 
-	if err := Set("foo", true); err != nil {
-		t.Fatal("Set: got error:\n", err)
-	}
+		if err := instance.Set("foo", true); err != nil {
+			t.Fatal("Instance.Set: got error:\n", err)
+		}
 
-	if foo, err := Get("foo"); err != nil {
-		t.Error("Get: got error:\n", err)
-	} else {
-		checkResultWithBool("Get", foo, true)
-	}
+		if foo, err := instance.Get("foo"); err != nil {
+			t.Error("Instance.Get: got error:\n", err)
+		} else {
+			checkResultWithBool("Get", foo, true)
+		}
 
-	if _, err := Get("bar"); err == nil {
-		t.Error("Get: expected error with non-existent entry")
-	}
+		if _, err := instance.Get("bar"); err == nil {
+			t.Error("Instance.Get: expected error with non-existent entry")
+		}
 
-	if err := Set("foo", false); err != nil {
-		t.Fatal("Set: got error:\n", err)
-	}
+		if err := instance.Set("foo", false); err != nil {
+			t.Fatal("Instance.Set: got error:\n", err)
+		}
 
-	foo := MustGet("foo")
-	checkResultWithBool("MustGet", foo, false)
+		foo := instance.MustGet("foo")
+		checkResultWithBool("MustGet", foo, false)
 
-	if err := panicked(func() { MustGet("bar") }); err == nil {
-		t.Error("MustGet: expected panic with non-existent entry")
-	} else if _, ok := err.(*ErrNoEntry); !ok {
-		t.Error("MustGet: expected error of type *ErrNoEntry")
-	}
+		if err := panicked(func() { instance.MustGet("bar") }); err == nil {
+			t.Error("Instance.MustGet: expected panic with non-existent entry")
+		} else if _, ok := err.(*ErrNoEntry); !ok {
+			t.Error("Instance.MustGet: expected error of type *ErrNoEntry")
+		}
 
-	if err := Set("foo", []string{"disallowed", "type"}); err == nil {
-		t.Error("Set: expected error with new value of disallowed type")
-	}
+		if err := instance.Set("foo", []string{"disallowed", "type"}); err == nil {
+			t.Error("Instance.Set: expected error with new value of disallowed type")
+		}
 
-	if err := Set("foo", 1784); err == nil {
-		t.Error("Set: expected error with new value of different type than existing")
-	}
+		if err := instance.Set("foo", 1784); err == nil {
+			t.Error("Instance.Set: expected error with new value of different type than existing")
+		}
 
-	if err := panicked(func() { MustSet("foo", true) }); err != nil {
-		t.Error("MustSet: got panic:\n", err)
-	}
+		if err := panicked(func() { instance.MustSet("foo", true) }); err != nil {
+			t.Error("Instance.MustSet: got panic:\n", err)
+		}
 
-	if err := panicked(func() { MustSet("foo", 1834) }); err == nil {
-		t.Error("MustSet: expected panic with new value of different type than existing")
-	}
+		if err := panicked(func() { instance.MustSet("foo", 1834) }); err == nil {
+			t.Error("Instance.MustSet: expected panic with new value of different type than existing")
+		}
 
-	if err := ForceSet("foo", 1873); err != nil {
-		t.Error("ForceSet: got error:\n", err)
-	}
+		if err := instance.ForceSet("foo", 1873); err != nil {
+			t.Error("Instance.ForceSet: got error:\n", err)
+		}
 
-	if err := panicked(func() { MustForceSet("foo", 1891) }); err != nil {
-		t.Error("MustForceSet: got panic:\n", err)
-	}
+		if err := panicked(func() { instance.MustForceSet("foo", 1891) }); err != nil {
+			t.Error("Instance.MustForceSet: got panic:\n", err)
+		}
 
-	if err := panicked(func() { MustForceSet("foo", []string{"disallowed", "type"}) }); err == nil {
-		t.Error("MustForceSet: expected panic with new value of disallowed type")
-	}
+		if err := panicked(func() { instance.MustForceSet("foo", []string{"disallowed", "type"}) }); err == nil {
+			t.Error("Instance.MustForceSet: expected panic with new value of disallowed type")
+		}
+	})
+}
+
+// TestDelete ensures that metadata entries inserted by means of a fixture are
+// properly deleted and that attempting to delete a non-existent entry results
+// in an ErrNoEntry.
+func TestDelete(t *testing.T) {
+	RunWithInstance(func(instance *Instance) {
+		InsertFixtures(instance, []EntryFixture{
+			{Name: "int", Value: "2891", ValueType: 1},
+			{Name: "string", Value: "hello world!", ValueType: 3},
+		})
+
+		if err := instance.Delete("int"); err != nil {
+			t.Error("Instance.Delete: got error:\n", err)
+		}
+
+		if err := panicked(func() { instance.MustDelete("string") }); err != nil {
+			t.Error("Instance.MustDelete: got panic:\n", err)
+		}
+
+		if err := instance.Delete("foo"); err == nil {
+			t.Error("Instance.Delete: expected error with non-existent entry")
+		} else if _, ok := err.(*ErrNoEntry); !ok {
+			t.Error("Instance.Delete: expected error of type *ErrNoEntry")
+		}
+
+		if err := panicked(func() { instance.MustDelete("foo") }); err == nil {
+			t.Error("Instance.MustDelete: expected panic with non-existent entry")
+		}
+	})
 }

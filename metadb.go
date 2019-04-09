@@ -4,16 +4,16 @@ metadata table within an SQL database.
 
 Basics
 
-To get started with metadb, open a database connection and prepare the metadata
-table:
+To get started with metadb, open a database connection and create a new
+instance:
 
 	database, _ := sql.Open(...) // Open a database connection
 	defer database.Close()
 
-	metadb.Prepare(database) // Prepare the metadata table
+	instance := metadb.NewInstance(database) // Create a new metadb Instance
 
-	metadb.Set("foo", "bar") // Set key "foo" to contain value "bar"
-	fmt.Println(metadb.Get("foo")) // Retrieve and print key "foo"
+	instance.MustSet("foo", "bar") // Set key "foo" to contain value "bar"
+	fmt.Println(instance.MustGet("foo")) // Retrieve and print key "foo"
 */
 package metadb
 
@@ -23,8 +23,6 @@ import (
 	"fmt"
 	"strconv"
 )
-
-var database *sql.DB
 
 // ErrNoEntry is returned by Get when a requested entry does not exist.
 type ErrNoEntry struct {
@@ -47,9 +45,24 @@ func (err *ErrFailedToParse) Error() string {
 	return fmt.Sprintf("metadb: failed to parse value blob string:\n%s", err.Err)
 }
 
-// Prepare takes a database object and creates the metadata table if it doesn't exist.
-func Prepare(db *sql.DB) {
-	_, err := db.Exec(`
+// Instance represents a single database connection with which metadata create,
+// read, update, and delete operation may be performed. It is not intended to
+// be manipulated manually, but rather through NewInstance and a variety of
+// methods.
+type Instance struct {
+	DB *sql.DB
+}
+
+// NewInstance takes a database handle and uses it to initialize the metadata
+// table within that database and perform all operations thereafter. If this is
+// successful, a pointer to an Instance is returned. Otherwise, an error is
+// returned.
+func NewInstance(db *sql.DB) (*Instance, error) {
+	if db == nil {
+		return nil, fmt.Errorf("NewInstance: got nil database handle")
+	}
+
+	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS metadata(
 			ID INT AUTO_INCREMENT PRIMARY KEY,
 			Name VARCHAR(255) NOT NULL UNIQUE,
@@ -57,18 +70,19 @@ func Prepare(db *sql.DB) {
 			ValueType TINYINT NOT NULL
 			-- 0 = bool, 1 = int, 2 = float64, 3 = string
 		);
-	`)
-
-	if err != nil {
-		panic(fmt.Errorf("failed to create metadata table:\n%s", err))
+	`); err != nil {
+		// TODO: Should errors such as this really be propagated? If such errors occur with one
+		// call to this function, the same error as was propagated the first time will occur with
+		// every call after until the underlying issue is fixed.
+		return nil, fmt.Errorf("NewInstance: got error while creating metadata table:\n%s", err)
 	}
 
-	database = db
+	return &Instance{db}, nil
 }
 
 // Exists returns true if the requested entry exists, and false if it does not.
-func Exists(name string) bool {
-	row := database.QueryRow("SELECT Name FROM metadata WHERE name = ?;", name)
+func (instance *Instance) Exists(name string) bool {
+	row := instance.DB.QueryRow("SELECT Name FROM metadata WHERE name = ?;", name)
 	var receivedName string
 	err := row.Scan(&receivedName)
 
@@ -78,7 +92,7 @@ func Exists(name string) bool {
 			return false
 		}
 
-		panic(fmt.Errorf("failed to check if metadata entry for '%s' exists:\n%s", name, err))
+		panic(fmt.Errorf("Instance.Exists: got error:\n%s", err))
 	}
 
 	return true
@@ -140,8 +154,8 @@ func fromBlobString(value string, valueType uint) (interface{}, error) {
 
 // getValueType returns an unsigned integer representing the type of data
 // stored in the requested metadata entry, or an ErrNoEntry if none exists.
-func getValueType(name string) (uint, error) {
-	row := database.QueryRow("SELECT ValueType FROM metadata WHERE name = ?", name)
+func (instance *Instance) getValueType(name string) (uint, error) {
+	row := instance.DB.QueryRow("SELECT ValueType FROM metadata WHERE name = ?", name)
 	var valueType uint
 	err := row.Scan(&valueType)
 
@@ -160,8 +174,8 @@ func getValueType(name string) (uint, error) {
 // Get returns an interface containing the data within the requested entry. If
 // the entry does not exist or if the stored data type identifier is invalid,
 // an error is returned.
-func Get(name string) (interface{}, error) {
-	row := database.QueryRow("SELECT Value, ValueType FROM metadata WHERE name = ?", name)
+func (instance *Instance) Get(name string) (interface{}, error) {
+	row := instance.DB.QueryRow("SELECT Value, ValueType FROM metadata WHERE name = ?", name)
 	var value string
 	var valueType uint
 	err := row.Scan(&value, &valueType)
@@ -179,8 +193,8 @@ func Get(name string) (interface{}, error) {
 }
 
 // MustGet does the same as Get, but panics if an error is returned.
-func MustGet(name string) interface{} {
-	if res, err := Get(name); err != nil {
+func (instance *Instance) MustGet(name string) interface{} {
+	if res, err := instance.Get(name); err != nil {
 		panic(err)
 	} else {
 		return res
@@ -189,17 +203,17 @@ func MustGet(name string) interface{} {
 
 // set implements the code shared between Set and ForceSet, using an additional
 // parameter to differentiate between the two.
-func set(name string, value interface{}, force bool) error {
+func (instance *Instance) set(name string, value interface{}, force bool) error {
 	valueType, err := toValueType(value)
 	if err != nil {
 		return err
 	}
 
-	currentType, err := getValueType(name)
+	currentType, err := instance.getValueType(name)
 	if err != nil {
 		// if error indicates that there is no entry by this name, insert one
 		if _, ok := err.(*ErrNoEntry); ok {
-			_, err = database.Exec(`INSERT INTO metadata (Name, Value, ValueType) VALUES (?, ?, ?);`, name, value, valueType)
+			_, err = instance.DB.Exec(`INSERT INTO metadata (Name, Value, ValueType) VALUES (?, ?, ?);`, name, value, valueType)
 			if err != nil {
 				return fmt.Errorf("metadb: failed to insert entry for '%s':\n%s", name, err)
 			}
@@ -214,7 +228,7 @@ func set(name string, value interface{}, force bool) error {
 	}
 
 	// Update entry
-	_, err = database.Exec(`UPDATE metadata SET Value = ? WHERE Name = ?;`, value, name)
+	_, err = instance.DB.Exec(`UPDATE metadata SET Value = ? WHERE Name = ?;`, value, name)
 	if err != nil {
 		return fmt.Errorf("metadb: failed to update entry for '%s':\n%s", name, err)
 	}
@@ -226,13 +240,13 @@ func set(name string, value interface{}, force bool) error {
 // one of bool, int, float64, or string, an error is returned. Or, if the entry
 // already exists and the data type of the new value is different than that of
 // the current, an error is also returned.
-func Set(name string, value interface{}) error {
-	return set(name, value, false)
+func (instance *Instance) Set(name string, value interface{}) error {
+	return instance.set(name, value, false)
 }
 
 // MustSet does the same as Set, but panics if an error is returned.
-func MustSet(name string, value interface{}) {
-	if err := Set(name, value); err != nil {
+func (instance *Instance) MustSet(name string, value interface{}) {
+	if err := instance.Set(name, value); err != nil {
 		panic(err)
 	}
 }
@@ -240,13 +254,35 @@ func MustSet(name string, value interface{}) {
 // ForceSet does the same as Set, but does not return an error if the entry
 // already exists and the data type of the new value is different than that of
 // the current.
-func ForceSet(name string, value interface{}) error {
-	return set(name, value, true)
+func (instance *Instance) ForceSet(name string, value interface{}) error {
+	return instance.set(name, value, true)
 }
 
 // MustForceSet does the same as ForceSet, but panics if an error is returned.
-func MustForceSet(name string, value interface{}) {
-	if err := ForceSet(name, value); err != nil {
+func (instance *Instance) MustForceSet(name string, value interface{}) {
+	if err := instance.ForceSet(name, value); err != nil {
+		panic(err)
+	}
+}
+
+// Delete removes a metadata entry. If the entry does not exist it returns an
+// error. If the database or database driver does not support `RowsAffected`,
+// no error is returned even if the entry does not exist.
+func (instance *Instance) Delete(name string) error {
+	if res, err := instance.DB.Exec(`DELETE FROM metadata WHERE name = ?;`, name); err != nil {
+		panic(fmt.Errorf("metadb: failed to delete entry for '%s':\n%s", name, err))
+	} else if affected, err := res.RowsAffected(); err != nil {
+		return nil
+	} else if affected == 0 {
+		return &ErrNoEntry{name}
+	}
+
+	return nil
+}
+
+// MustDelete does the same as Delete, but panics if an error is returned.
+func (instance *Instance) MustDelete(name string) {
+	if err := instance.Delete(name); err != nil {
 		panic(err)
 	}
 }
